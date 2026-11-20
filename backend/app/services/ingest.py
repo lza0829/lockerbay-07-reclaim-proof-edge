@@ -48,7 +48,7 @@ def run_batch():
                 ).fetchone()
                 if row:
                     conn.execute(
-                        "UPDATE occupancies SET closed_at=?, status='released', last_event_id=? WHERE id=?",
+                        "UPDATE occupancies SET closed_at=?, status='released', close_reason='pickup', last_event_id=? WHERE id=?",
                         (ev["event_ts"], ev["id"], row["id"]),
                     )
                     conn.execute("UPDATE cells SET status='free' WHERE id=?", (ev["cell_id"],))

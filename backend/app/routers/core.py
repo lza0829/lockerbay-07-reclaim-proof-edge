@@ -1,9 +1,11 @@
-from fastapi import APIRouter, Body, HTTPException
+from fastapi import APIRouter, Body, HTTPException, Query
 
 from app.db import connect
+from app.modules import reclaim_proof_edge as edge_reclaim
 from app.seed import overdue_hours
 from app.services import bay as bay_svc
 from app.services import ingest as ingest_svc
+from app.services import reclaim_fixtures
 
 router = APIRouter(prefix="/api")
 
@@ -106,5 +108,102 @@ def put_overdue(body: dict = Body(...)):
         )
         conn.commit()
         return {"overdue_hours": hours}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- 回收边与占用核证同源
+
+
+@router.get("/reclaim/candidates")
+def reclaim_candidates(as_of: str | None = Query(default=None)):
+    """只读：超时未取、可回收的占用；不写库。"""
+    conn = connect()
+    try:
+        hours = overdue_hours(conn)
+        at = edge_reclaim.normalize_ts(as_of)
+        return {
+            "as_of": at,
+            "overdue_hours": hours,
+            "candidates": edge_reclaim.overdue_candidates(conn, as_of=at, overdue_hours=hours),
+        }
+    except edge_reclaim.ReclaimError as exc:
+        raise HTTPException(400, f"{exc.code}: {exc.message}")
+    finally:
+        conn.close()
+
+
+@router.post("/reclaim/scan")
+def reclaim_scan(body: dict = Body(default={})):
+    """超时扫描自动回收：每笔同事务写边 + 关占用 + 核证盖关闭时刻。"""
+    conn = connect()
+    try:
+        result = edge_reclaim.scan_and_reclaim(
+            conn,
+            as_of=body.get("as_of"),
+            overdue_hours=body.get("overdue_hours"),
+            limit=int(body.get("limit", 200)),
+            dry_run=bool(body.get("dry_run", False)),
+        )
+        return result
+    except edge_reclaim.ReclaimError as exc:
+        raise HTTPException(400, f"{exc.code}: {exc.message}")
+    finally:
+        conn.close()
+
+
+@router.post("/reclaim/occupancies/{occupancy_id}")
+def reclaim_one(occupancy_id: str, body: dict = Body(default={})):
+    conn = connect()
+    try:
+        return edge_reclaim.reclaim_occupancy(
+            conn,
+            occupancy_id,
+            as_of=body.get("as_of"),
+            overdue_hours=body.get("overdue_hours"),
+        )
+    except edge_reclaim.ReclaimError as exc:
+        status = 404 if exc.code in {"occupancy_missing"} else 409
+        raise HTTPException(status, f"{exc.code}: {exc.message}")
+    finally:
+        conn.close()
+
+
+@router.get("/reclaim/edges")
+def reclaim_edges():
+    """只读核证接口：回收边列表 + 逐边校验 + 汇总；边有缺漏时 ok=false。"""
+    conn = connect()
+    try:
+        return edge_reclaim.validate_edges(conn)
+    finally:
+        conn.close()
+
+
+@router.get("/occupancies/{occupancy_id}/reclaim-trace")
+def reclaim_trace(occupancy_id: str):
+    """由关闭占用追到回收边与占用核证；无边则核证校验失败。"""
+    conn = connect()
+    try:
+        trace = edge_reclaim.trace_occupancy(conn, occupancy_id)
+        if trace is None:
+            raise HTTPException(404, f"占用不存在：{occupancy_id}")
+        return trace
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- 本地夹具
+
+
+@router.post("/reclaim/fixtures/{name}")
+def load_reclaim_fixture(name: str):
+    """装载本地夹具：case（可回收投柜）或 missing-edge（故意缺边）。"""
+    conn = connect()
+    try:
+        result = reclaim_fixtures.load(name, conn)
+        if not result.get("loaded"):
+            raise HTTPException(404, result.get("message", "夹具装载失败"))
+        result["verify"] = edge_reclaim.validate_edges(conn)
+        return result
     finally:
         conn.close()
